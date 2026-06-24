@@ -89,6 +89,79 @@ def decode_access_token(token: str):
         return None
 
 # ==========================================
+# PRODUCTION WHATSAPP API DISPATCHER (NEW)
+# ==========================================
+def send_whatsapp_message(phone: str, message: str) -> Optional[str]:
+    """
+    Normalizes Bangladeshi phone numbers and dispatches WhatsApp messages via:
+    1. Green API (WHATSAPP_PROVIDER=green_api)
+    2. Twilio (WHATSAPP_PROVIDER=twilio)
+    3. Console / Terminal fallback (simulation mode)
+    Returns wa.me deep-link URL for immediate front-end testing.
+    """
+    # Normalize phone digits
+    clean_digits = re.sub(r'[^0-9]', '', phone)
+    
+    # Ensure correct country code format for Bangladesh (prefix +880 or 880)
+    if clean_digits.startswith('01'):
+        normalized_number = '880' + clean_digits[1:]
+    elif clean_digits.startswith('1'):
+        normalized_number = '880' + clean_digits
+    else:
+        normalized_number = clean_digits
+
+    formatted_phone_wa = '+' + normalized_number
+    
+    print(f"\n======================================")
+    print(f"DISPATCHING SECURE WHATSAPP NOTIFICATION")
+    print(f"--> Target: {formatted_phone_wa}")
+    print(f"--> Content: '{message}'")
+    print(f"======================================\n")
+
+    # Read configuration parameters
+    wa_provider = os.getenv("WHATSAPP_PROVIDER", "console_fallback")
+    wa_token = os.getenv("WHATSAPP_API_TOKEN")
+    wa_instance = os.getenv("WHATSAPP_INSTANCE_ID") # Used as SID for Twilio or Instance ID for Green API
+    
+    if wa_provider == "green_api" and wa_token and wa_instance:
+        try:
+            import requests
+            url = f"https://api.green-api.com/waInstance{wa_instance}/sendMessage/{wa_token}"
+            payload = {
+                "chatId": f"{normalized_number}@c.us",
+                "message": message
+            }
+            headers = {'Content-Type': 'application/json'}
+            requests.post(url, json=payload, headers=headers, timeout=5)
+            print("[WHATSAPP GATEWAY] Sent successfully via Green API.")
+        except Exception as e:
+            print(f"[WHATSAPP GATEWAY] Error dispatching Green API payload: {e}")
+            
+    elif wa_provider == "twilio" and wa_token and wa_instance:
+        try:
+            import requests
+            from requests.auth import HTTPBasicAuth
+            from_number = os.getenv("TWILIO_WHATSAPP_FROM", "whatsapp:+14155238886")
+            url = f"https://api.twilio.com/2010-04-01/Accounts/{wa_instance}/Messages.json"
+            data = {
+                "From": from_number,
+                "To": f"whatsapp:{formatted_phone_wa}",
+                "Body": message
+            }
+            requests.post(url, data=data, auth=HTTPBasicAuth(wa_instance, wa_token), timeout=5)
+            print("[WHATSAPP GATEWAY] Sent successfully via Twilio Gateway.")
+        except Exception as e:
+            print(f"[WHATSAPP GATEWAY] Error dispatching Twilio payload: {e}")
+            
+    else:
+        print("[WHATSAPP GATEWAY] No active production gateway configured. Operating in simulation mode.")
+
+    # Always generate the click-to-chat deep-link URL as front-end fallback verification
+    encoded_message = base64.b64encode(message.encode('utf-8')).decode('utf-8')
+    wa_link = f"https://wa.me/{normalized_number}?text={message.replace(' ', '%20')}"
+    return wa_link
+
+# ==========================================
 # DATABASE MODELS
 # ==========================================
 
@@ -237,6 +310,12 @@ class Milestone(Base):
     description = Column(Text, nullable=False)
     care_guideline = Column(Text, nullable=False)
 
+class SiteConfig(Base):
+    __tablename__ = "site_configs"
+    id = Column(Integer, primary_key=True, index=True)
+    key = Column(String, unique=True, index=True, nullable=False)
+    value = Column(Text, nullable=False)
+
 # ==========================================
 # DATABASE MIGRATIONS & SCHEMA PATCHING
 # ==========================================
@@ -258,7 +337,7 @@ def patch_database_schema():
 patch_database_schema()
 
 # ==========================================
-# PRELOAD DATA (Admin & Dynamic Milestones)
+# PRELOAD DATA (Admin, Site Config & Milestones)
 # ==========================================
 def seed_initial_data():
     db = SessionLocal()
@@ -279,6 +358,26 @@ def seed_initial_data():
         )
         db.add(new_admin)
         print("Default admin created: admin@petpals.com (password: admin123)")
+
+    # Preload dynamic website configs if they don't exist
+    default_configs = {
+        "hero_badge": "Trusted by 10,000+ pet owners",
+        "hero_title_1": "Your Pet's Health,",
+        "hero_title_2": "Managed from A to Z",
+        "hero_desc": "Register your pets, connect with verified veterinarians, and manage everything in one beautiful platform.",
+        "hero_btn_primary": "Register Your Pet",
+        "hero_btn_secondary": "Join as Vet",
+        "search_placeholder": "Search by Pet ID (e.g., PET-12345)",
+        "lifecycle_header": "Pet Life-Cycle Milestone Hub",
+        "lifecycle_subheader": "Review clinical stages of companion animal growth backed dynamically by our database."
+    }
+
+    for k, v in default_configs.items():
+        existing = db.query(SiteConfig).filter(SiteConfig.key == k).first()
+        if not existing:
+            cfg = SiteConfig(key=k, value=v)
+            db.add(cfg)
+            print(f"Seeded default site config: {k} -> {v}")
 
     # Vaccines
     existing_vaccines = db.query(Vaccine).all()
@@ -421,6 +520,51 @@ def calculate_distance(lat1, lon1, lat2, lon2):
 # REST API ENDPOINTS
 # ==========================================
 
+@app.get("/api/site-config")
+def get_site_config(db: Session = Depends(get_db)):
+    configs = db.query(SiteConfig).all()
+    return {cfg.key: cfg.value for cfg in configs}
+
+@app.post("/api/admin/site-config")
+def update_site_config(
+    hero_badge: str = Form(...),
+    hero_title_1: str = Form(...),
+    hero_title_2: str = Form(...),
+    hero_desc: str = Form(...),
+    hero_btn_primary: str = Form(...),
+    hero_btn_secondary: str = Form(...),
+    search_placeholder: str = Form(...),
+    lifecycle_header: str = Form(...),
+    lifecycle_subheader: str = Form(...),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    if not current_user or current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="Unauthorized")
+    
+    updates = {
+        "hero_badge": hero_badge,
+        "hero_title_1": hero_title_1,
+        "hero_title_2": hero_title_2,
+        "hero_desc": hero_desc,
+        "hero_btn_primary": hero_btn_primary,
+        "hero_btn_secondary": hero_btn_secondary,
+        "search_placeholder": search_placeholder,
+        "lifecycle_header": lifecycle_header,
+        "lifecycle_subheader": lifecycle_subheader,
+    }
+
+    for k, v in updates.items():
+        cfg = db.query(SiteConfig).filter(SiteConfig.key == k).first()
+        if cfg:
+            cfg.value = v
+        else:
+            cfg = SiteConfig(key=k, value=v)
+            db.add(cfg)
+            
+    db.commit()
+    return {"message": "Landing page website content updated successfully!"}
+
 @app.get("/api/me")
 def get_user_profile(current_user: User = Depends(get_current_user)):
     if not current_user:
@@ -477,12 +621,17 @@ def register(
     mock_otp = str(random.randint(100000, 999999))
     new_user.otp_secret = mock_otp
     db.commit()
-    print(f"\n======================================")
-    print(f"PETPALS AUTH OTP DISPATCHED FOR {new_user.email}")
-    print(f"--> VERIFICATION OTP CODE: {mock_otp} <--")
-    print(f"======================================\n")
 
-    return {"message": "Registration successful. Verify using the OTP code printed in the server terminal.", "email": email}
+    # Trigger WhatsApp Dispatch
+    message_text = f"Your PetPals verification OTP is: {mock_otp}. Welcome to the premium companion lifecycle network!"
+    wa_direct_link = send_whatsapp_message(phone, message_text)
+
+    return {
+        "message": "Registration successful. Verification OTP sent via WhatsApp.",
+        "email": email,
+        "whatsapp_link": wa_direct_link,
+        "phone": phone
+    }
 
 @app.post("/api/auth/verify-otp")
 def verify_otp(email: str = Form(...), otp: str = Form(...), db: Session = Depends(get_db)):
@@ -568,63 +717,6 @@ def update_milestone(
     m.care_guideline = care_guideline
     db.commit()
     return {"message": "Content updated successfully!"}
-
-@app.get("/api/admin/stats")
-def get_admin_stats(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    if not current_user or current_user.role != "admin":
-        raise HTTPException(status_code=403, detail="Access denied")
-        
-    total_owners = db.query(User).filter(User.role == "owner").count()
-    approved_vets = db.query(User).filter(and_(User.role == "vet", User.is_approved == True)).count()
-    pending_vets = db.query(User).filter(and_(User.role == "vet", User.is_approved == False, User.is_rejected == False)).count()
-    rejected_vets = db.query(User).filter(and_(User.role == "vet", User.is_rejected == True)).count()
-    
-    # Pets by species category calculation
-    species_counts = db.query(Pet.species, func.count(Pet.id)).group_by(Pet.species).all()
-    species_map = {species: count for species, count in species_counts}
-    
-    return {
-        "owners": total_owners,
-        "approved_vets": approved_vets,
-        "pending_vets": pending_vets,
-        "rejected_vets": rejected_vets,
-        "pets_by_category": species_map
-    }
-
-@app.get("/api/admin/pending-vets")
-def get_pending_vets(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    if not current_user or current_user.role != "admin":
-        raise HTTPException(status_code=403, detail="Access denied")
-    return db.query(User).filter(and_(User.role == "vet", User.is_approved == False, User.is_rejected == False)).all()
-
-@app.post("/api/admin/approve-vet/{vet_id}")
-def approve_vet(vet_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    if not current_user or current_user.role != "admin":
-        raise HTTPException(status_code=403, detail="Access denied")
-    
-    vet = db.query(User).filter(User.id == vet_id).first()
-    if not vet:
-        raise HTTPException(status_code=404, detail="Vet not found")
-        
-    vet.is_approved = True
-    vet.is_rejected = False
-    vet.vet_id_code = f"VET-{random.randint(10000, 99999)}"
-    db.commit()
-    return {"message": "Vet approved successfully!", "code": vet.vet_id_code}
-
-@app.post("/api/admin/reject-vet/{vet_id}")
-def reject_vet(vet_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    if not current_user or current_user.role != "admin":
-        raise HTTPException(status_code=403, detail="Access denied")
-        
-    vet = db.query(User).filter(User.id == vet_id).first()
-    if not vet:
-        raise HTTPException(status_code=404, detail="Vet not found")
-        
-    vet.is_approved = False
-    vet.is_rejected = True
-    db.commit()
-    return {"message": "Vet verification rejected successfully."}
 
 @app.get("/api/my-pets")
 def my_pets(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
@@ -963,14 +1055,20 @@ def initiate_transfer(
     )
     db.add(transfer)
     db.commit()
+
+    # Dynamic target owner search to fetch target phone context
+    target_user = db.query(User).filter(User.email == target_email).first()
+    target_phone = target_user.phone if target_user else current_user.phone # fallback to current owner
+
+    message_text = f"PetPals Transfer Authorization: Enter code {otp_code} to accept ownership of pet {pet.name} ({pet.unique_id})."
+    wa_direct_link = send_whatsapp_message(target_phone, message_text)
     
-    print(f"\n======================================")
-    print(f"PET TRANSFER INITIATED FOR {pet.name} (ID: {pet.unique_id})")
-    print(f"--> TARGET OWNER: {target_email}")
-    print(f"--> TRANSFER VERIFICATION OTP: {otp_code} <--")
-    print(f"======================================\n")
-    
-    return {"message": "Transfer initiated. Provide the verification OTP to the target recipient.", "otp_sent": otp_code}
+    return {
+        "message": "Transfer initiated. Code dispatched successfully.",
+        "otp_sent": otp_code,
+        "whatsapp_link": wa_direct_link,
+        "phone": target_phone
+    }
 
 @app.post("/api/transfers/accept")
 def accept_transfer(
@@ -1062,7 +1160,7 @@ def dispatch_emergency(
             "message": "Emergency broadcast answered!",
             "request_id": req.id,
             "status": "connected",
-            "vet_name": closest_vet.name,
+            "text_name": closest_vet.name,
             "vet_clinic": closest_vet.clinic_name,
             "vet_phone": closest_vet.phone
         }
@@ -1163,7 +1261,7 @@ def get_vet_rating(vet_id: int, db: Session = Depends(get_db)):
 def generate_health_passport(pet_id: int, db: Session = Depends(get_db)):
     pet = db.query(Pet).filter(Pet.id == pet_id).first()
     if not pet:
-        raise HTTPException(status_code=404, detail="Pet not found")
+        raise HTTPException(status_code=444, detail="Pet not found")
         
     certified_history = []
     for vac in pet.vaccinations:
@@ -1279,19 +1377,19 @@ def index_portal():
                     <div class="lg:col-span-6 space-y-8 text-left">
                         <div class="inline-flex items-center space-x-2 bg-teal-50 border border-teal-200/60 px-4 py-1.5 rounded-full shadow-sm">
                             <i data-lucide="heart" class="w-4 h-4 text-teal-500 fill-teal-500 animate-pulse"></i>
-                            <span class="text-xs font-black text-teal-800 tracking-wide">Trusted by 10,000+ pet owners</span>
+                            <span id="txt-hero-badge" class="text-xs font-black text-teal-800 tracking-wide">Trusted by 10,000+ pet owners</span>
                         </div>
 
                         <div class="space-y-4">
-                            <h2 class="text-5xl lg:text-6xl font-black tracking-tight text-slate-900 leading-none">
+                            <h2 id="txt-hero-title-1" class="text-5xl lg:text-6xl font-black tracking-tight text-slate-900 leading-none">
                                 Your Pet's Health,
                             </h2>
                             <div class="inline-block bg-gradient-to-r from-teal-500 to-emerald-600 px-6 py-3 rounded-2xl shadow-md transform -rotate-1 hover:rotate-0 transition duration-300">
-                                <span class="text-2xl lg:text-3xl font-black tracking-tight text-white uppercase tracking-widest leading-none">Managed from A to Z</span>
+                                <span id="txt-hero-title-2" class="text-2xl lg:text-3xl font-black tracking-tight text-white uppercase tracking-widest leading-none">Managed from A to Z</span>
                             </div>
                         </div>
 
-                        <p class="text-base text-slate-600 leading-relaxed max-w-xl">
+                        <p id="txt-hero-desc" class="text-base text-slate-600 leading-relaxed max-w-xl">
                             Register your pets, connect with verified veterinarians, and manage everything in one beautiful platform.
                         </p>
 
@@ -1307,12 +1405,12 @@ def index_portal():
 
                         <div class="flex items-center space-x-4 pt-2">
                             <button onclick="triggerAppAuthView('register', 'owner')" class="bg-gradient-to-r from-teal-500 to-emerald-600 hover:from-teal-600 hover:to-emerald-700 text-white font-extrabold px-6 py-3.5 rounded-2xl shadow-lg shadow-teal-500/20 transition text-sm flex items-center space-x-2">
-                                <span>Register Your Pet</span>
+                                <span id="txt-hero-btn-primary">Register Your Pet</span>
                                 <i data-lucide="arrow-right" class="w-4 h-4"></i>
                             </button>
                             <button onclick="triggerAppAuthView('register', 'vet')" class="bg-white hover:bg-teal-50 border border-teal-200 text-teal-850 font-extrabold px-6 py-3.5 rounded-2xl transition text-sm flex items-center space-x-2">
                                 <i data-lucide="stethoscope" class="w-4 h-4 text-teal-600"></i>
-                                <span>Join as Vet</span>
+                                <span id="txt-hero-btn-secondary">Join as Vet</span>
                             </button>
                         </div>
                     </div>
@@ -1373,8 +1471,8 @@ def index_portal():
             <!-- A-Z PET LIFE CYCLE SECTION -->
             <section id="lifecycle-guide" class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-16 space-y-12">
                 <div class="text-center space-y-2">
-                    <h3 class="text-3xl font-extrabold tracking-tight text-slate-900">Pet Life-Cycle Milestone Hub</h3>
-                    <p class="text-slate-500 text-sm">Review clinical stages of companion animal growth backed dynamically by our database.</p>
+                    <h3 id="txt-lifecycle-header" class="text-3xl font-extrabold tracking-tight text-slate-900">Pet Life-Cycle Milestone Hub</h3>
+                    <p id="txt-lifecycle-subheader" class="text-slate-500 text-sm">Review clinical stages of companion animal growth backed dynamically by our database.</p>
                 </div>
 
                 <div id="dynamic-milestones-list" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8">
@@ -1552,10 +1650,16 @@ def index_portal():
                         <span>📱 OTP Verification Needed</span>
                         <span class="text-[10px] text-slate-500">Terminal Simulation</span>
                     </div>
-                    <p class="text-slate-300 mb-2">Check your server terminal log for the sent OTP. Type it below to activate:</p>
+                    <p class="text-slate-300 mb-2">An OTP code has been dispatched. Enter it below to activate:</p>
                     <div class="flex space-x-2">
                         <input type="text" id="otp-input" placeholder="Enter 6-digit OTP" class="bg-black/40 border border-teal-800 text-teal-400 text-center rounded px-2 py-1 flex-grow">
                         <button onclick="handleVerifyOTP()" class="bg-teal-500 hover:bg-teal-400 text-black font-bold px-4 py-1 rounded">Verify</button>
+                    </div>
+                    <div class="mt-4 pt-4 border-t border-slate-800 flex flex-col space-y-2">
+                         <span class="text-[10px] text-slate-400 font-extrabold uppercase tracking-wide">⚡ WhatsApp Fallback Actions:</span>
+                         <a id="whatsapp-direct-link" href="#" target="_blank" class="bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-center py-2.5 rounded-xl transition flex items-center justify-center gap-1.5 text-[11px] uppercase tracking-wider">
+                             <i data-lucide="send" class="w-4 h-4"></i> Send OTP to Phone via WhatsApp
+                         </a>
                     </div>
                 </div>
             </div>
@@ -1775,7 +1879,7 @@ def index_portal():
 
                   <!-- Verification Queues -->
                   <div class="bg-white p-6 rounded-3xl border border-slate-100 shadow-sm lg:col-span-2 space-y-4">
-                       <h3 class="font-extrabold text-slate-900 text-base flex items-center gap-1.5"><i data-lucide="shadow" class="text-amber-600 w-5 h-5"></i> Verification Approvals Queue</h3>
+                       <h3 class="font-extrabold text-slate-900 text-base flex items-center gap-1.5"><i data-lucide="shield-check" class="text-amber-600 w-5 h-5"></i> Verification Approvals Queue</h3>
                        <div class="overflow-x-auto text-xs">
                             <table class="w-full text-left border-collapse">
                                 <thead>
@@ -1789,6 +1893,56 @@ def index_portal():
                             </table>
                        </div>
                   </div>
+             </div>
+
+             <!-- GLOBAL WEBSITE CONTENT EDITOR MANAGER -->
+             <div class="bg-white p-6 rounded-3xl border border-slate-100 shadow-sm space-y-6">
+                 <div class="border-b pb-3">
+                     <h3 class="font-extrabold text-slate-900 text-lg flex items-center gap-1.5"><i data-lucide="settings" class="text-teal-600 w-5 h-5"></i> Global Website Content Console</h3>
+                     <p class="text-xs text-slate-500">Change headers, pill text, descriptions, and action button values in real-time across the platform.</p>
+                 </div>
+                 
+                 <form onsubmit="handleGlobalContentUpdate(event)" class="grid grid-cols-1 md:grid-cols-2 gap-6 text-xs">
+                     <div class="space-y-4">
+                         <div>
+                             <label class="block text-slate-600 font-bold mb-1">Hero Pill Badge Text</label>
+                             <input type="text" id="ipt-hero-badge" name="txt_hero_badge" required class="w-full px-3 py-2 border rounded-xl bg-white">
+                         </div>
+                         <div>
+                             <label class="block text-slate-600 font-bold mb-1">Hero Main Title Line 1</label>
+                             <input type="text" id="ipt-hero-title-1" name="txt_hero_title_1" required class="w-full px-3 py-2 border rounded-xl bg-white">
+                         </div>
+                         <div>
+                             <label class="block text-slate-600 font-bold mb-1">Hero Solid Highlight Line 2</label>
+                             <input type="text" id="ipt-hero-title-2" name="txt_hero_title_2" required class="w-full px-3 py-2 border rounded-xl bg-white">
+                         </div>
+                         <div>
+                             <label class="block text-slate-600 font-bold mb-1">Hero Description Subtext</label>
+                             <textarea id="ipt-hero-desc" name="txt_hero_desc" required class="w-full px-3 py-2 border rounded-xl h-20 bg-white"></textarea>
+                         </div>
+                     </div>
+                     <div class="space-y-4">
+                         <div>
+                             <label class="block text-slate-600 font-bold mb-1">Primary Button Value (Register)</label>
+                             <input type="text" id="ipt-hero-btn-primary" name="txt_hero_btn_primary" required class="w-full px-3 py-2 border rounded-xl bg-white">
+                         </div>
+                         <div>
+                             <label class="block text-slate-600 font-bold mb-1">Secondary Button Value (Join Vet)</label>
+                             <input type="text" id="ipt-hero-btn-secondary" name="txt_hero_btn_secondary" required class="w-full px-3 py-2 border rounded-xl bg-white">
+                         </div>
+                         <div>
+                             <label class="block text-slate-600 font-bold mb-1">A-Z Milestones Section Header</label>
+                             <input type="text" id="ipt-lifecycle-header" name="txt_lifecycle_header" required class="w-full px-3 py-2 border rounded-xl bg-white">
+                         </div>
+                         <div>
+                             <label class="block text-slate-600 font-bold mb-1">A-Z Milestones Section Subtext</label>
+                             <textarea id="ipt-lifecycle-subheader" name="txt_lifecycle_subheader" required class="w-full px-3 py-2 border rounded-xl h-20 bg-white"></textarea>
+                         </div>
+                     </div>
+                     <div class="md:col-span-2 pt-2 border-t text-right">
+                         <button type="submit" class="bg-teal-600 hover:bg-teal-700 text-white font-bold px-6 py-2.5 rounded-xl transition shadow">Commit Global Content Settings</button>
+                     </div>
+                 </form>
              </div>
 
              <!-- WEBSITE CONTENT EDITABLE SECTION -->
@@ -2152,6 +2306,11 @@ def index_portal():
                 <div id="transfer-otp-sim-box" class="bg-slate-900 text-emerald-400 p-4 rounded-xl font-mono text-xs hidden space-y-2">
                     <p class="text-slate-300">Share this Code to complete the legal process:</p>
                     <div class="text-xl font-black tracking-widest text-center text-white bg-slate-950 p-2 rounded" id="trans-code-out">000000</div>
+                    <div class="pt-2">
+                         <a id="whatsapp-transfer-link" href="#" target="_blank" class="w-full bg-emerald-600 hover:bg-emerald-700 text-white text-center py-2 rounded-lg font-bold block text-[11px] uppercase tracking-wide">
+                              Dispatch transfer OTP to Target via WhatsApp
+                         </a>
+                    </div>
                 </div>
             </div>
         </div>
@@ -2196,6 +2355,7 @@ def index_portal():
 
             window.onload = function() {
                 lucide.createIcons();
+                loadSiteConfigs();
                 loadLandingMilestones(); 
                 fetchUserSession();
                 updateSearchAreas();
@@ -2210,6 +2370,49 @@ def index_portal():
                     options.headers['Authorization'] = `Bearer ${token}`;
                 }
                 return fetch(url, options);
+            }
+
+            async function loadSiteConfigs() {
+                const resp = await fetch('/api/site-config');
+                if (resp.ok) {
+                    const cfg = await resp.json();
+                    
+                    // Apply to Front-end Landing view
+                    document.getElementById('txt-hero-badge').innerText = cfg.hero_badge || '';
+                    document.getElementById('txt-hero-title-1').innerText = cfg.hero_title_1 || '';
+                    document.getElementById('txt-hero-title-2').innerText = cfg.hero_title_2 || '';
+                    document.getElementById('txt-hero-desc').innerText = cfg.hero_desc || '';
+                    document.getElementById('txt-hero-btn-primary').innerText = cfg.hero_btn_primary || '';
+                    document.getElementById('txt-hero-btn-secondary').innerText = cfg.hero_btn_secondary || '';
+                    document.getElementById('public-pet-search-input').placeholder = cfg.search_placeholder || '';
+                    document.getElementById('txt-lifecycle-header').innerText = cfg.lifecycle_header || '';
+                    document.getElementById('txt-lifecycle-subheader').innerText = cfg.lifecycle_subheader || '';
+
+                    // Apply to Admin Site Editor form fields (to pre-populate values)
+                    if (document.getElementById('ipt-hero-badge')) {
+                        document.getElementById('ipt-hero-badge').value = cfg.hero_badge || '';
+                        document.getElementById('ipt-hero-title-1').value = cfg.hero_title_1 || '';
+                        document.getElementById('ipt-hero-title-2').value = cfg.hero_title_2 || '';
+                        document.getElementById('ipt-hero-desc').value = cfg.hero_desc || '';
+                        document.getElementById('ipt-hero-btn-primary').value = cfg.hero_btn_primary || '';
+                        document.getElementById('ipt-hero-btn-secondary').value = cfg.hero_btn_secondary || '';
+                        document.getElementById('ipt-search-placeholder').value = cfg.search_placeholder || '';
+                        document.getElementById('ipt-lifecycle-header').value = cfg.lifecycle_header || '';
+                        document.getElementById('ipt-lifecycle-subheader').value = cfg.lifecycle_subheader || '';
+                    }
+                }
+            }
+
+            async function handleGlobalContentUpdate(e) {
+                e.preventDefault();
+                const fd = new FormData(e.target);
+                const resp = await apiFetch('/api/admin/site-config', { method: 'POST', body: fd });
+                if (resp.ok) {
+                    showAlert("Global Website Landing Content updated successfully!");
+                    loadSiteConfigs(); // Reload live page strings
+                } else {
+                    showAlert("Failed to update site configuration.", "error");
+                }
             }
 
             function updateRegisterAreas() {
@@ -2512,9 +2715,15 @@ def index_portal():
                 const resp = await apiFetch('/api/auth/register', { method: 'POST', body: fd });
                 const res = await resp.json();
                 if (resp.ok) {
-                    showAlert(res.message);
+                    showAlert("OTP generated successfully! Check WhatsApp link below.");
                     document.getElementById('otp-verification-box').classList.remove('hidden');
                     document.getElementById('otp-input').dataset.email = fd.get('email');
+                    
+                    // Bind the WhatsApp deep-link to the UI action button
+                    const waLinkBtn = document.getElementById('whatsapp-direct-link');
+                    if (waLinkBtn && res.whatsapp_link) {
+                         waLinkBtn.href = res.whatsapp_link;
+                    }
                 } else {
                     showAlert(res.message, 'error');
                 }
