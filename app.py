@@ -369,7 +369,8 @@ def seed_initial_data():
         "hero_btn_secondary": "Join as Vet",
         "search_placeholder": "Search by Pet ID (e.g., PET-12345)",
         "lifecycle_header": "Pet Life-Cycle Milestone Hub",
-        "lifecycle_subheader": "Review clinical stages of companion animal growth backed dynamically by our database."
+        "lifecycle_subheader": "Review clinical stages of companion animal growth backed dynamically by our database.",
+        "hero_image": "",
     }
 
     for k, v in default_configs.items():
@@ -526,7 +527,7 @@ def get_site_config(db: Session = Depends(get_db)):
     return {cfg.key: cfg.value for cfg in configs}
 
 @app.post("/api/admin/site-config")
-def update_site_config(
+async def update_site_config(
     hero_badge: str = Form(...),
     hero_title_1: str = Form(...),
     hero_title_2: str = Form(...),
@@ -536,6 +537,8 @@ def update_site_config(
     search_placeholder: str = Form(...),
     lifecycle_header: str = Form(...),
     lifecycle_subheader: str = Form(...),
+    clear_hero_image: Optional[str] = Form(None),
+    hero_image_file: Optional[UploadFile] = File(None),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
@@ -561,6 +564,25 @@ def update_site_config(
         else:
             cfg = SiteConfig(key=k, value=v)
             db.add(cfg)
+
+    if clear_hero_image in ("true", "on", "1"):
+        hero_image_value = ""
+    elif hero_image_file and hero_image_file.filename:
+        try:
+            file_bytes = await hero_image_file.read()
+            encoded_base64 = base64.b64encode(file_bytes).decode("utf-8")
+            hero_image_value = f"data:{hero_image_file.content_type};base64,{encoded_base64}"
+        except Exception:
+            hero_image_value = None
+    else:
+        hero_image_value = None
+
+    if hero_image_value is not None:
+        cfg = db.query(SiteConfig).filter(SiteConfig.key == "hero_image").first()
+        if cfg:
+            cfg.value = hero_image_value
+        else:
+            db.add(SiteConfig(key="hero_image", value=hero_image_value))
             
     db.commit()
     return {"message": "Landing page website content updated successfully!"}
@@ -1415,10 +1437,11 @@ def index_portal():
                         </div>
                     </div>
 
-                    <!-- Right Column Cozy Veterinarian Room Scene -->
+                    <!-- Right Column Hero Panel (custom image or default illustration) -->
                     <div class="lg:col-span-6 relative">
                         <div class="bg-gradient-to-br from-teal-100/40 to-emerald-100/10 p-4 rounded-[2rem] border border-teal-100/20 shadow-xl overflow-hidden">
-                            <div class="aspect-[16/10] bg-[#FFFBF5] border border-teal-100/50 rounded-2xl p-6 relative flex flex-col justify-between overflow-hidden">
+                            <img id="hero-custom-image" class="hidden w-full aspect-[16/10] object-cover rounded-2xl border border-teal-100/50 shadow-inner" alt="Hero panel">
+                            <div id="hero-default-scene" class="aspect-[16/10] bg-[#FFFBF5] border border-teal-100/50 rounded-2xl p-6 relative flex flex-col justify-between overflow-hidden">
                                 <div class="absolute top-4 left-6 border border-slate-200/80 bg-white rounded-lg p-2 w-32 shadow-sm text-left">
                                     <div class="w-full h-1 bg-teal-100 rounded mb-1"></div>
                                     <div class="w-3/4 h-1 bg-teal-100 rounded mb-1"></div>
@@ -1899,44 +1922,58 @@ def index_portal():
              <div class="bg-white p-6 rounded-3xl border border-slate-100 shadow-sm space-y-6">
                  <div class="border-b pb-3">
                      <h3 class="font-extrabold text-slate-900 text-lg flex items-center gap-1.5"><i data-lucide="settings" class="text-teal-600 w-5 h-5"></i> Global Website Content Console</h3>
-                     <p class="text-xs text-slate-500">Change headers, pill text, descriptions, and action button values in real-time across the platform.</p>
+                     <p class="text-xs text-slate-500">Change headers, hero image, pill text, descriptions, and action button values in real-time across the platform.</p>
                  </div>
                  
-                 <form onsubmit="handleGlobalContentUpdate(event)" class="grid grid-cols-1 md:grid-cols-2 gap-6 text-xs">
+                 <form id="form-global-content" onsubmit="handleGlobalContentUpdate(event)" enctype="multipart/form-data" class="grid grid-cols-1 md:grid-cols-2 gap-6 text-xs">
                      <div class="space-y-4">
                          <div>
                              <label class="block text-slate-600 font-bold mb-1">Hero Pill Badge Text</label>
-                             <input type="text" id="ipt-hero-badge" name="txt_hero_badge" required class="w-full px-3 py-2 border rounded-xl bg-white">
+                             <input type="text" id="ipt-hero-badge" name="hero_badge" required class="w-full px-3 py-2 border rounded-xl bg-white">
                          </div>
                          <div>
                              <label class="block text-slate-600 font-bold mb-1">Hero Main Title Line 1</label>
-                             <input type="text" id="ipt-hero-title-1" name="txt_hero_title_1" required class="w-full px-3 py-2 border rounded-xl bg-white">
+                             <input type="text" id="ipt-hero-title-1" name="hero_title_1" required class="w-full px-3 py-2 border rounded-xl bg-white">
                          </div>
                          <div>
                              <label class="block text-slate-600 font-bold mb-1">Hero Solid Highlight Line 2</label>
-                             <input type="text" id="ipt-hero-title-2" name="txt_hero_title_2" required class="w-full px-3 py-2 border rounded-xl bg-white">
+                             <input type="text" id="ipt-hero-title-2" name="hero_title_2" required class="w-full px-3 py-2 border rounded-xl bg-white">
                          </div>
                          <div>
                              <label class="block text-slate-600 font-bold mb-1">Hero Description Subtext</label>
-                             <textarea id="ipt-hero-desc" name="txt_hero_desc" required class="w-full px-3 py-2 border rounded-xl h-20 bg-white"></textarea>
+                             <textarea id="ipt-hero-desc" name="hero_desc" required class="w-full px-3 py-2 border rounded-xl h-20 bg-white"></textarea>
+                         </div>
+                         <div>
+                             <label class="block text-slate-600 font-bold mb-1">Public Search Placeholder</label>
+                             <input type="text" id="ipt-search-placeholder" name="search_placeholder" required class="w-full px-3 py-2 border rounded-xl bg-white">
                          </div>
                      </div>
                      <div class="space-y-4">
                          <div>
                              <label class="block text-slate-600 font-bold mb-1">Primary Button Value (Register)</label>
-                             <input type="text" id="ipt-hero-btn-primary" name="txt_hero_btn_primary" required class="w-full px-3 py-2 border rounded-xl bg-white">
+                             <input type="text" id="ipt-hero-btn-primary" name="hero_btn_primary" required class="w-full px-3 py-2 border rounded-xl bg-white">
                          </div>
                          <div>
                              <label class="block text-slate-600 font-bold mb-1">Secondary Button Value (Join Vet)</label>
-                             <input type="text" id="ipt-hero-btn-secondary" name="txt_hero_btn_secondary" required class="w-full px-3 py-2 border rounded-xl bg-white">
+                             <input type="text" id="ipt-hero-btn-secondary" name="hero_btn_secondary" required class="w-full px-3 py-2 border rounded-xl bg-white">
                          </div>
                          <div>
                              <label class="block text-slate-600 font-bold mb-1">A-Z Milestones Section Header</label>
-                             <input type="text" id="ipt-lifecycle-header" name="txt_lifecycle_header" required class="w-full px-3 py-2 border rounded-xl bg-white">
+                             <input type="text" id="ipt-lifecycle-header" name="lifecycle_header" required class="w-full px-3 py-2 border rounded-xl bg-white">
                          </div>
                          <div>
                              <label class="block text-slate-600 font-bold mb-1">A-Z Milestones Section Subtext</label>
-                             <textarea id="ipt-lifecycle-subheader" name="txt_lifecycle_subheader" required class="w-full px-3 py-2 border rounded-xl h-20 bg-white"></textarea>
+                             <textarea id="ipt-lifecycle-subheader" name="lifecycle_subheader" required class="w-full px-3 py-2 border rounded-xl h-20 bg-white"></textarea>
+                         </div>
+                         <div class="pt-2 border-t border-slate-100">
+                             <label class="block text-slate-600 font-bold mb-1">Hero Panel Image</label>
+                             <p class="text-[10px] text-slate-400 mb-2">Upload a custom image for the landing page hero panel. Leave empty to keep the current image.</p>
+                             <img id="ipt-hero-image-preview" class="hidden w-full max-h-40 object-cover rounded-xl border border-teal-100 mb-2" alt="Hero preview">
+                             <input type="file" id="ipt-hero-image" name="hero_image_file" accept="image/*" onchange="previewHeroImageSelection(event)" class="w-full text-xs text-slate-500 file:mr-4 file:py-2 file:px-4 file:rounded-xl file:border-0 file:text-xs file:font-semibold file:bg-teal-50 file:text-teal-700 hover:file:bg-teal-100 bg-white">
+                             <label class="flex items-center gap-2 mt-2 text-slate-600 cursor-pointer">
+                                 <input type="checkbox" id="ipt-clear-hero-image" name="clear_hero_image" value="true" class="rounded border-slate-300 text-teal-600 focus:ring-teal-500">
+                                 <span>Reset hero panel to default illustration</span>
+                             </label>
                          </div>
                      </div>
                      <div class="md:col-span-2 pt-2 border-t text-right">
@@ -2372,6 +2409,50 @@ def index_portal():
                 return fetch(url, options);
             }
 
+            function applyHeroPanelImage(heroImageData) {
+                const defaultScene = document.getElementById('hero-default-scene');
+                const customImg = document.getElementById('hero-custom-image');
+                const hasCustomImage = heroImageData && heroImageData.startsWith('data:image');
+
+                if (hasCustomImage) {
+                    defaultScene.classList.add('hidden');
+                    customImg.src = heroImageData;
+                    customImg.classList.remove('hidden');
+                } else {
+                    defaultScene.classList.remove('hidden');
+                    customImg.classList.add('hidden');
+                    customImg.removeAttribute('src');
+                }
+            }
+
+            function updateHeroImagePreview(heroImageData) {
+                const preview = document.getElementById('ipt-hero-image-preview');
+                if (!preview) return;
+
+                if (heroImageData && heroImageData.startsWith('data:image')) {
+                    preview.src = heroImageData;
+                    preview.classList.remove('hidden');
+                } else {
+                    preview.classList.add('hidden');
+                    preview.removeAttribute('src');
+                }
+            }
+
+            function previewHeroImageSelection(event) {
+                const file = event.target.files[0];
+                const preview = document.getElementById('ipt-hero-image-preview');
+                if (!file || !preview) return;
+
+                const reader = new FileReader();
+                reader.onload = (ev) => {
+                    preview.src = ev.target.result;
+                    preview.classList.remove('hidden');
+                    const clearCheckbox = document.getElementById('ipt-clear-hero-image');
+                    if (clearCheckbox) clearCheckbox.checked = false;
+                };
+                reader.readAsDataURL(file);
+            }
+
             async function loadSiteConfigs() {
                 const resp = await fetch('/api/site-config');
                 if (resp.ok) {
@@ -2387,6 +2468,7 @@ def index_portal():
                     document.getElementById('public-pet-search-input').placeholder = cfg.search_placeholder || '';
                     document.getElementById('txt-lifecycle-header').innerText = cfg.lifecycle_header || '';
                     document.getElementById('txt-lifecycle-subheader').innerText = cfg.lifecycle_subheader || '';
+                    applyHeroPanelImage(cfg.hero_image || '');
 
                     // Apply to Admin Site Editor form fields (to pre-populate values)
                     if (document.getElementById('ipt-hero-badge')) {
@@ -2399,6 +2481,11 @@ def index_portal():
                         document.getElementById('ipt-search-placeholder').value = cfg.search_placeholder || '';
                         document.getElementById('ipt-lifecycle-header').value = cfg.lifecycle_header || '';
                         document.getElementById('ipt-lifecycle-subheader').value = cfg.lifecycle_subheader || '';
+                        updateHeroImagePreview(cfg.hero_image || '');
+                        const clearCheckbox = document.getElementById('ipt-clear-hero-image');
+                        if (clearCheckbox) clearCheckbox.checked = false;
+                        const heroFileInput = document.getElementById('ipt-hero-image');
+                        if (heroFileInput) heroFileInput.value = '';
                     }
                 }
             }
@@ -2409,7 +2496,7 @@ def index_portal():
                 const resp = await apiFetch('/api/admin/site-config', { method: 'POST', body: fd });
                 if (resp.ok) {
                     showAlert("Global Website Landing Content updated successfully!");
-                    loadSiteConfigs(); // Reload live page strings
+                    loadSiteConfigs();
                 } else {
                     showAlert("Failed to update site configuration.", "error");
                 }
