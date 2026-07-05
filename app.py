@@ -764,7 +764,27 @@ def register(
         "message": "Registration successful. Verification OTP sent via WhatsApp.",
         "email": email,
         "whatsapp_link": wa_direct_link,
-        "phone": phone
+        "phone": phone,
+        "otp_sent": True,
+    }
+
+@app.post("/api/auth/resend-otp")
+def resend_otp(email: str = Form(...), db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.email == email).first()
+    if not user or user.otp_secret is None:
+        raise HTTPException(status_code=400, detail="No pending verification found for this account.")
+
+    new_otp = str(random.randint(100000, 999999))
+    user.otp_secret = new_otp
+    db.commit()
+
+    message_text = f"Your PetPals verification OTP is: {new_otp}. Welcome to the premium companion lifecycle network!"
+    wa_direct_link = send_whatsapp_message(user.phone, message_text)
+
+    return {
+        "message": "A new verification code has been sent to your WhatsApp.",
+        "whatsapp_link": wa_direct_link,
+        "phone": user.phone,
     }
 
 @app.post("/api/auth/verify-otp")
@@ -1779,24 +1799,6 @@ def index_portal():
 
                     <button type="submit" class="w-full bg-emerald-600 hover:bg-emerald-700 text-white font-bold py-3 rounded-xl transition duration-150">Create Account</button>
                 </form>
-
-                <div id="otp-verification-box" class="mt-6 bg-slate-900 text-teal-400 p-4 rounded-xl font-mono text-xs hidden">
-                    <div class="flex items-center justify-between border-b border-slate-800 pb-2 mb-2">
-                        <span>📱 OTP Verification Needed</span>
-                        <span class="text-[10px] text-slate-500">Terminal Simulation</span>
-                    </div>
-                    <p class="text-slate-300 mb-2">An OTP code has been dispatched. Enter it below to activate:</p>
-                    <div class="flex space-x-2">
-                        <input type="text" id="otp-input" placeholder="Enter 6-digit OTP" class="bg-black/40 border border-teal-800 text-teal-400 text-center rounded px-2 py-1 flex-grow">
-                        <button onclick="handleVerifyOTP()" class="bg-teal-500 hover:bg-teal-400 text-black font-bold px-4 py-1 rounded">Verify</button>
-                    </div>
-                    <div class="mt-4 pt-4 border-t border-slate-800 flex flex-col space-y-2">
-                         <span class="text-[10px] text-slate-400 font-extrabold uppercase tracking-wide">⚡ WhatsApp Fallback Actions:</span>
-                         <a id="whatsapp-direct-link" href="#" target="_blank" class="bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-center py-2.5 rounded-xl transition flex items-center justify-center gap-1.5 text-[11px] uppercase tracking-wider">
-                             <i data-lucide="send" class="w-4 h-4"></i> Send OTP to Phone via WhatsApp
-                         </a>
-                    </div>
-                </div>
             </div>
         </section>
 
@@ -2144,6 +2146,35 @@ def index_portal():
         <!-- ==========================================
           MODALS & FLYOUTS SECTION
         ========================================== -->
+
+        <!-- Modal: WhatsApp OTP Verification -->
+        <div id="modal-otp-verify" class="fixed inset-0 bg-black/60 backdrop-blur-sm z-[60] flex items-center justify-center p-4 hidden text-slate-700">
+            <div class="bg-white rounded-2xl max-w-md w-full shadow-2xl border border-slate-100 overflow-hidden animate-in fade-in zoom-in-95 duration-200">
+                <div class="bg-emerald-600 p-5 text-white flex items-center justify-between">
+                    <h3 class="font-bold text-lg flex items-center gap-2">
+                        <i data-lucide="message-circle" class="w-5 h-5"></i>
+                        <span>Verify WhatsApp OTP</span>
+                    </h3>
+                    <button onclick="closeModal('otp-verify')" class="text-white hover:text-emerald-200"><i data-lucide="x"></i></button>
+                </div>
+                <form onsubmit="handleVerifyOTP(event)" class="p-6 space-y-5">
+                    <div class="text-center space-y-2">
+                        <div class="mx-auto w-14 h-14 bg-emerald-50 rounded-full flex items-center justify-center">
+                            <i data-lucide="smartphone" class="w-7 h-7 text-emerald-600"></i>
+                        </div>
+                        <p class="text-sm text-slate-600">We sent a 6-digit verification code to your WhatsApp number:</p>
+                        <p id="otp-verify-phone" class="font-bold text-slate-900 text-lg"></p>
+                    </div>
+                    <div>
+                        <label class="block text-xs font-bold text-slate-500 uppercase mb-2 text-center">Enter Verification Code</label>
+                        <input type="text" id="otp-input" maxlength="6" inputmode="numeric" pattern="[0-9]{6}" placeholder="000000" required class="w-full text-center text-2xl tracking-[0.4em] font-mono py-3 border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-500 bg-white">
+                    </div>
+                    <input type="hidden" id="otp-email-field">
+                    <button type="submit" class="w-full bg-emerald-600 hover:bg-emerald-700 text-white font-bold py-3 rounded-xl transition">Verify & Activate Account</button>
+                    <button type="button" onclick="handleResendOTP()" class="w-full text-sm text-emerald-700 font-semibold hover:text-emerald-900 transition">Resend code to WhatsApp</button>
+                </form>
+            </div>
+        </div>
         
         <!-- Modal: Add Pet Form -->
         <div id="modal-add-pet" class="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4 hidden text-slate-700">
@@ -2936,23 +2967,38 @@ def index_portal():
                 const resp = await apiFetch('/api/auth/register', { method: 'POST', body: fd });
                 const res = await resp.json();
                 if (resp.ok) {
-                    showAlert("OTP generated successfully! Check WhatsApp link below.");
-                    document.getElementById('otp-verification-box').classList.remove('hidden');
-                    document.getElementById('otp-input').dataset.email = fd.get('email');
-                    
-                    // Bind the WhatsApp deep-link to the UI action button
-                    const waLinkBtn = document.getElementById('whatsapp-direct-link');
-                    if (waLinkBtn && res.whatsapp_link) {
-                         waLinkBtn.href = res.whatsapp_link;
-                    }
+                    document.getElementById('otp-email-field').value = res.email || fd.get('email');
+                    document.getElementById('otp-verify-phone').innerText = formatPhoneDisplay(res.phone || fd.get('phone'));
+                    document.getElementById('otp-input').value = '';
+                    openModal('otp-verify');
+                    setTimeout(() => document.getElementById('otp-input').focus(), 150);
+                    lucide.createIcons();
+                    showAlert("Verification code sent to your WhatsApp number.");
                 } else {
                     showAlert(res.message, 'error');
                 }
             }
 
-            async function handleVerifyOTP() {
-                const otp = document.getElementById('otp-input').value;
-                const email = document.getElementById('otp-input').dataset.email;
+            function formatPhoneDisplay(phone) {
+                if (!phone) return '';
+                const digits = phone.replace(/\D/g, '');
+                let normalized = digits;
+                if (digits.startsWith('01')) {
+                    normalized = '880' + digits.substring(1);
+                } else if (!digits.startsWith('880')) {
+                    normalized = '880' + digits;
+                }
+                return '+' + normalized;
+            }
+
+            async function handleVerifyOTP(e) {
+                if (e) e.preventDefault();
+                const otp = document.getElementById('otp-input').value.trim();
+                const email = document.getElementById('otp-email-field').value;
+                if (!otp || otp.length !== 6) {
+                    showAlert("Please enter the 6-digit code from WhatsApp.", "error");
+                    return;
+                }
                 const fd = new FormData();
                 fd.append('email', email);
                 fd.append('otp', otp);
@@ -2960,11 +3006,28 @@ def index_portal():
                 const resp = await apiFetch('/api/auth/verify-otp', { method: 'POST', body: fd });
                 const res = await resp.json();
                 if (resp.ok) {
-                    showAlert(res.message);
-                    document.getElementById('otp-verification-box').classList.add('hidden');
+                    showAlert("Account verified successfully! You can now sign in.");
+                    closeModal('otp-verify');
                     toggleAuthTab('login');
                 } else {
-                    showAlert(res.detail, 'error');
+                    showAlert(res.detail || "Invalid verification code.", 'error');
+                }
+            }
+
+            async function handleResendOTP() {
+                const email = document.getElementById('otp-email-field').value;
+                if (!email) return;
+                const fd = new FormData();
+                fd.append('email', email);
+                const resp = await apiFetch('/api/auth/resend-otp', { method: 'POST', body: fd });
+                const res = await resp.json();
+                if (resp.ok) {
+                    document.getElementById('otp-verify-phone').innerText = formatPhoneDisplay(res.phone);
+                    document.getElementById('otp-input').value = '';
+                    document.getElementById('otp-input').focus();
+                    showAlert("A new verification code has been sent to your WhatsApp.");
+                } else {
+                    showAlert(res.detail || "Could not resend verification code.", "error");
                 }
             }
 
