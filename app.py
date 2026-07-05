@@ -587,6 +587,118 @@ async def update_site_config(
     db.commit()
     return {"message": "Landing page website content updated successfully!"}
 
+ADMIN_PET_SPECIES = ["Dog", "Cat", "Bird", "Rabbit", "Reptile", "Other"]
+
+def normalize_pet_species(species: str) -> str:
+    for sp in ADMIN_PET_SPECIES[:-1]:
+        if species and species.lower() == sp.lower():
+            return sp
+    return "Other"
+
+@app.get("/api/admin/stats")
+def admin_stats(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    if not current_user or current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="Unauthorized")
+
+    owners = db.query(User).filter(User.role == "owner").count()
+    approved_vets = db.query(User).filter(User.role == "vet", User.is_approved == True).count()
+    pending_vets = db.query(User).filter(
+        User.role == "vet", User.is_approved == False, User.is_rejected == False
+    ).count()
+    rejected_vets = db.query(User).filter(User.role == "vet", User.is_rejected == True).count()
+
+    pets_by_category = {sp: 0 for sp in ADMIN_PET_SPECIES}
+    for pet in db.query(Pet).all():
+        pets_by_category[normalize_pet_species(pet.species)] += 1
+
+    return {
+        "owners": owners,
+        "approved_vets": approved_vets,
+        "pending_vets": pending_vets,
+        "rejected_vets": rejected_vets,
+        "pets_by_category": pets_by_category,
+        "total_pets": sum(pets_by_category.values()),
+    }
+
+@app.get("/api/admin/pets")
+def admin_list_pets_by_species(
+    species: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    if not current_user or current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="Unauthorized")
+
+    if species not in ADMIN_PET_SPECIES:
+        raise HTTPException(status_code=400, detail="Invalid species category")
+
+    results = []
+    for pet in db.query(Pet).order_by(Pet.created_at.desc()).all():
+        if normalize_pet_species(pet.species) != species:
+            continue
+        owner = db.query(User).filter(User.id == pet.owner_id).first()
+        results.append({
+            "id": pet.id,
+            "unique_id": pet.unique_id,
+            "name": pet.name,
+            "species": pet.species,
+            "breed": pet.breed or "N/A",
+            "dob": pet.dob.strftime("%Y-%m-%d"),
+            "microchip": pet.microchip or "N/A",
+            "owner_name": owner.name if owner else "Unknown Owner",
+            "owner_email": owner.email if owner else "",
+            "owner_phone": owner.phone if owner else "N/A",
+        })
+    return results
+
+@app.get("/api/admin/pending-vets")
+def admin_pending_vets(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    if not current_user or current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="Unauthorized")
+
+    vets = db.query(User).filter(
+        User.role == "vet", User.is_approved == False, User.is_rejected == False
+    ).all()
+    return [{
+        "id": v.id,
+        "name": v.name,
+        "email": v.email,
+        "phone": v.phone,
+        "clinic_name": v.clinic_name,
+        "license_number": v.license_number,
+        "specialization": v.specialization,
+    } for v in vets]
+
+@app.post("/api/admin/approve-vet/{vet_id}")
+def admin_approve_vet(vet_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    if not current_user or current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="Unauthorized")
+
+    vet = db.query(User).filter(User.id == vet_id, User.role == "vet").first()
+    if not vet:
+        raise HTTPException(status_code=404, detail="Vet not found")
+
+    vet.is_approved = True
+    vet.is_rejected = False
+    if not vet.vet_id_code:
+        vet.vet_id_code = f"VET-{random.randint(10000, 99999)}"
+    db.commit()
+    return {"message": "Veterinarian approved successfully."}
+
+@app.post("/api/admin/reject-vet/{vet_id}")
+def admin_reject_vet(vet_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    if not current_user or current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="Unauthorized")
+
+    vet = db.query(User).filter(User.id == vet_id, User.role == "vet").first()
+    if not vet:
+        raise HTTPException(status_code=404, detail="Vet not found")
+
+    vet.is_approved = False
+    vet.is_rejected = True
+    db.commit()
+    return {"message": "Veterinarian application rejected."}
+
 @app.get("/api/me")
 def get_user_profile(current_user: User = Depends(get_current_user)):
     if not current_user:
@@ -1851,7 +1963,7 @@ def index_portal():
 
         <!-- VIEW 3: STRICT ADMIN SYSTEM DASHBOARD -->
         <section id="view-admin" class="hidden flex-grow max-w-7xl w-full mx-auto p-4 sm:p-6 lg:p-8 space-y-8 overflow-y-auto text-slate-700">
-             <div class="flex items-center justify-between border-b pb-4">
+             <div class="flex flex-wrap items-center justify-between border-b pb-4 gap-4">
                   <div class="flex items-center space-x-3">
                        <span class="bg-teal-600 text-white text-xs font-black uppercase px-3 py-1 rounded-full">Secure Admin Shell</span>
                        <h2 class="text-3xl font-black text-slate-900 tracking-tight">Administrative Control Dashboard</h2>
@@ -1859,6 +1971,13 @@ def index_portal():
                   <button onclick="handleLogout()" class="bg-slate-800 hover:bg-slate-900 text-white text-xs font-bold px-4 py-2 rounded-xl transition">Sign Out</button>
              </div>
 
+             <nav class="flex items-center space-x-2 bg-slate-100 p-1 rounded-xl w-fit">
+                  <button onclick="showAdminPanel('dashboard')" id="btn-admin-dashboard" class="admin-tab-btn px-5 py-2 text-sm font-bold bg-white text-teal-800 shadow-sm rounded-lg border-b-2 border-teal-600">Dashboard</button>
+                  <button onclick="showAdminPanel('content')" id="btn-admin-content" class="admin-tab-btn px-5 py-2 text-sm font-semibold text-slate-600 rounded-lg">Content Management</button>
+             </nav>
+
+             <!-- ADMIN SECTION: DASHBOARD -->
+             <div id="admin-panel-dashboard" class="space-y-8">
              <!-- ANALYTICS CARDS -->
              <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6">
                   <div class="bg-white p-6 rounded-3xl border border-slate-100 shadow-sm flex items-center space-x-4">
@@ -1896,8 +2015,19 @@ def index_portal():
                   <!-- Chart Component -->
                   <div class="bg-white p-6 rounded-3xl border border-slate-100 shadow-sm space-y-4">
                        <h3 class="font-extrabold text-slate-900 text-base flex items-center gap-1.5"><i data-lucide="bar-chart" class="text-teal-600 w-5 h-5"></i> Pets Population Distribution Chart</h3>
-                       <p class="text-xs text-slate-500">Distribution analysis calculated dynamically across all registered animals.</p>
+                       <p class="text-xs text-slate-500">Click any category bar to view the registered pets in that group.</p>
                        <div id="pets-distribution-chart" class="space-y-3 pt-4 text-xs"></div>
+
+                       <div id="admin-pet-drilldown" class="hidden mt-4 pt-4 border-t border-slate-100">
+                            <div class="flex items-center justify-between mb-3">
+                                 <h4 id="admin-pet-drilldown-title" class="font-bold text-slate-900 text-sm flex items-center gap-1.5">
+                                      <i data-lucide="list" class="w-4 h-4 text-teal-600"></i>
+                                      <span>Registered Pets</span>
+                                 </h4>
+                                 <button onclick="closeAdminPetDrilldown()" class="text-[10px] font-bold text-slate-500 hover:text-slate-800 px-2 py-1 rounded-lg hover:bg-slate-100">Close</button>
+                            </div>
+                            <div id="admin-pet-drilldown-list" class="space-y-2 max-h-72 overflow-y-auto"></div>
+                       </div>
                   </div>
 
                   <!-- Verification Queues -->
@@ -1917,7 +2047,10 @@ def index_portal():
                        </div>
                   </div>
              </div>
+             </div>
 
+             <!-- ADMIN SECTION: CONTENT MANAGEMENT -->
+             <div id="admin-panel-content" class="space-y-8 hidden">
              <!-- GLOBAL WEBSITE CONTENT EDITOR MANAGER -->
              <div class="bg-white p-6 rounded-3xl border border-slate-100 shadow-sm space-y-6">
                  <div class="border-b pb-3">
@@ -2004,6 +2137,7 @@ def index_portal():
                             <tbody id="admin-milestone-rows"></tbody>
                        </table>
                   </div>
+             </div>
              </div>
         </section>
 
@@ -3319,7 +3453,90 @@ def index_portal():
                 lookupNearbyVets();
             }
 
+            let selectedAdminSpecies = null;
+
+            function showAdminPanel(panelName) {
+                const panels = ['dashboard', 'content'];
+                panels.forEach(name => {
+                    const panel = document.getElementById(`admin-panel-${name}`);
+                    const btn = document.getElementById(`btn-admin-${name}`);
+                    if (!panel || !btn) return;
+
+                    if (name === panelName) {
+                        panel.classList.remove('hidden');
+                        btn.className = "admin-tab-btn px-5 py-2 text-sm font-bold bg-white text-teal-800 shadow-sm rounded-lg border-b-2 border-teal-600";
+                    } else {
+                        panel.classList.add('hidden');
+                        btn.className = "admin-tab-btn px-5 py-2 text-sm font-semibold text-slate-600 rounded-lg";
+                    }
+                });
+            }
+
+            function closeAdminPetDrilldown() {
+                selectedAdminSpecies = null;
+                const drilldown = document.getElementById('admin-pet-drilldown');
+                if (drilldown) drilldown.classList.add('hidden');
+                document.querySelectorAll('.admin-chart-row').forEach(row => {
+                    row.classList.remove('ring-2', 'ring-teal-400', 'bg-teal-50/40');
+                });
+            }
+
+            async function loadAdminPetsBySpecies(species) {
+                selectedAdminSpecies = species;
+                const drilldown = document.getElementById('admin-pet-drilldown');
+                const title = document.getElementById('admin-pet-drilldown-title');
+                const list = document.getElementById('admin-pet-drilldown-list');
+
+                document.querySelectorAll('.admin-chart-row').forEach(row => {
+                    row.classList.remove('ring-2', 'ring-teal-400', 'bg-teal-50/40');
+                    if (row.dataset.species === species) {
+                        row.classList.add('ring-2', 'ring-teal-400', 'bg-teal-50/40');
+                    }
+                });
+
+                title.innerHTML = `<i data-lucide="list" class="w-4 h-4 text-teal-600"></i><span>Registered ${species}s</span>`;
+                list.innerHTML = `<p class="text-xs text-slate-400 italic p-2">Loading ${species.toLowerCase()} records...</p>`;
+                drilldown.classList.remove('hidden');
+
+                const resp = await apiFetch(`/api/admin/pets?species=${encodeURIComponent(species)}`);
+                if (!resp.ok) {
+                    list.innerHTML = `<p class="text-xs text-rose-500 p-2">Failed to load pet records.</p>`;
+                    return;
+                }
+
+                const pets = await resp.json();
+                list.innerHTML = "";
+
+                if (pets.length === 0) {
+                    list.innerHTML = `<p class="text-xs text-slate-400 italic p-3 bg-slate-50 rounded-xl border border-slate-100">No registered ${species.toLowerCase()} pets found in the system.</p>`;
+                    lucide.createIcons();
+                    return;
+                }
+
+                pets.forEach(pet => {
+                    const row = document.createElement('div');
+                    row.className = "p-3 bg-slate-50 rounded-xl border border-slate-100 text-xs space-y-1";
+                    row.innerHTML = `
+                        <div class="flex items-center justify-between gap-2">
+                            <span class="font-extrabold text-slate-900">${pet.name}</span>
+                            <span class="font-mono text-amber-600 font-bold">${pet.unique_id}</span>
+                        </div>
+                        <div class="text-slate-600 grid grid-cols-1 sm:grid-cols-2 gap-x-4 gap-y-0.5">
+                            <div><b>Breed:</b> ${pet.breed}</div>
+                            <div><b>DOB:</b> ${pet.dob}</div>
+                            <div><b>Owner:</b> ${pet.owner_name}</div>
+                            <div><b>Phone:</b> ${pet.owner_phone}</div>
+                            <div class="sm:col-span-2"><b>Email:</b> ${pet.owner_email || 'N/A'}</div>
+                            <div><b>Microchip:</b> ${pet.microchip}</div>
+                        </div>
+                    `;
+                    list.appendChild(row);
+                });
+                lucide.createIcons();
+            }
+
             async function loadAdminStatsAndQueues() {
+                 showAdminPanel('dashboard');
                  const statsResp = await apiFetch('/api/admin/stats');
                  if (statsResp.ok) {
                       const stats = await statsResp.json();
@@ -3336,12 +3553,16 @@ def index_portal():
                            "Dog": "bg-teal-500", "Cat": "bg-indigo-500", "Bird": "bg-sky-500",
                            "Rabbit": "bg-pink-500", "Reptile": "bg-amber-600", "Other": "bg-slate-400"
                       };
+                      const totalPets = stats.total_pets || 0;
 
                       species.forEach(sp => {
                            const count = stats.pets_by_category[sp] || 0;
-                           const barWidth = count > 0 ? Math.min(100, (count / 10) * 100) : 5;
+                           const barWidth = totalPets > 0 ? Math.max(5, Math.round((count / totalPets) * 100)) : 5;
                            const row = document.createElement('div');
-                           row.className = "space-y-1";
+                           row.className = "admin-chart-row space-y-1 p-2 -mx-2 rounded-xl cursor-pointer hover:bg-slate-50 transition";
+                           row.dataset.species = sp;
+                           row.title = `View all registered ${sp.toLowerCase()} pets`;
+                           row.onclick = () => loadAdminPetsBySpecies(sp);
                            row.innerHTML = `
                                <div class="flex justify-between font-bold text-slate-700">
                                    <span>${sp}s</span>
@@ -3353,6 +3574,12 @@ def index_portal():
                            `;
                            chartBox.appendChild(row);
                       });
+
+                      if (selectedAdminSpecies) {
+                           loadAdminPetsBySpecies(selectedAdminSpecies);
+                      } else {
+                           closeAdminPetDrilldown();
+                      }
                  }
 
                  const vetResp = await apiFetch('/api/admin/pending-vets');
