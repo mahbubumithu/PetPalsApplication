@@ -5,7 +5,14 @@ import math
 import random
 import base64
 from datetime import datetime, timedelta
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
+from urllib.parse import quote
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 from fastapi import FastAPI, Depends, HTTPException, status, Request, Form, UploadFile, File
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
@@ -91,52 +98,75 @@ def decode_access_token(token: str):
 # ==========================================
 # PRODUCTION WHATSAPP API DISPATCHER (NEW)
 # ==========================================
-def send_whatsapp_message(phone: str, message: str) -> Optional[str]:
-    """
-    Normalizes Bangladeshi phone numbers and dispatches WhatsApp messages via:
-    1. Green API (WHATSAPP_PROVIDER=green_api)
-    2. Twilio (WHATSAPP_PROVIDER=twilio)
-    3. Console / Terminal fallback (simulation mode)
-    Returns wa.me deep-link URL for immediate front-end testing.
-    """
-    # Normalize phone digits
-    clean_digits = re.sub(r'[^0-9]', '', phone)
-    
-    # Ensure correct country code format for Bangladesh (prefix +880 or 880)
+def normalize_whatsapp_number(phone: str) -> str:
+    clean_digits = re.sub(r'[^0-9]', '', phone or '')
+    if clean_digits.startswith('880'):
+        return clean_digits
     if clean_digits.startswith('01'):
-        normalized_number = '880' + clean_digits[1:]
-    elif clean_digits.startswith('1'):
-        normalized_number = '880' + clean_digits
-    else:
-        normalized_number = clean_digits
+        return '880' + clean_digits[1:]
+    if clean_digits.startswith('1') and len(clean_digits) == 11:
+        return '880' + clean_digits
+    return clean_digits
 
-    formatted_phone_wa = '+' + normalized_number
-    
-    print(f"\n======================================")
-    print(f"DISPATCHING SECURE WHATSAPP NOTIFICATION")
+def send_whatsapp_message(phone: str, message: str) -> Dict[str, Any]:
+    """
+    Dispatches WhatsApp messages via Green API, Twilio, or simulation fallback.
+    Returns delivery metadata for the UI and logs.
+    """
+    normalized_number = normalize_whatsapp_number(phone)
+    formatted_phone_wa = '+' + normalized_number if normalized_number else ''
+    wa_link = f"https://wa.me/{normalized_number}?text={quote(message)}"
+
+    wa_provider = (os.getenv("WHATSAPP_PROVIDER") or "").strip().lower()
+    wa_token = (os.getenv("WHATSAPP_API_TOKEN") or os.getenv("GREEN_API_TOKEN") or "").strip()
+    wa_instance = (os.getenv("WHATSAPP_INSTANCE_ID") or os.getenv("GREEN_API_INSTANCE_ID") or "").strip()
+
+    if wa_provider in ("", "console_fallback", "auto") and wa_token and wa_instance:
+        wa_provider = "green_api"
+
+    result = {
+        "success": False,
+        "provider": wa_provider or "console_fallback",
+        "whatsapp_link": wa_link,
+        "phone": formatted_phone_wa,
+        "error": None,
+    }
+
+    print("\n======================================")
+    print("DISPATCHING WHATSAPP NOTIFICATION")
     print(f"--> Target: {formatted_phone_wa}")
+    print(f"--> Provider: {result['provider']}")
     print(f"--> Content: '{message}'")
-    print(f"======================================\n")
+    print("======================================\n")
 
-    # Read configuration parameters
-    wa_provider = os.getenv("WHATSAPP_PROVIDER", "console_fallback")
-    wa_token = os.getenv("WHATSAPP_API_TOKEN")
-    wa_instance = os.getenv("WHATSAPP_INSTANCE_ID") # Used as SID for Twilio or Instance ID for Green API
-    
+    if not normalized_number:
+        result["error"] = "Invalid phone number."
+        return result
+
     if wa_provider == "green_api" and wa_token and wa_instance:
         try:
             import requests
             url = f"https://api.green-api.com/waInstance{wa_instance}/sendMessage/{wa_token}"
             payload = {
                 "chatId": f"{normalized_number}@c.us",
-                "message": message
+                "message": message,
             }
-            headers = {'Content-Type': 'application/json'}
-            requests.post(url, json=payload, headers=headers, timeout=5)
-            print("[WHATSAPP GATEWAY] Sent successfully via Green API.")
+            response = requests.post(url, json=payload, headers={"Content-Type": "application/json"}, timeout=15)
+            if response.status_code == 200:
+                data = response.json()
+                if data.get("idMessage"):
+                    result["success"] = True
+                    print(f"[WHATSAPP] Green API accepted message id={data.get('idMessage')}")
+                else:
+                    result["error"] = data.get("message") or str(data)
+                    print(f"[WHATSAPP] Green API rejected payload: {data}")
+            else:
+                result["error"] = f"Green API HTTP {response.status_code}: {response.text}"
+                print(f"[WHATSAPP] Green API error: {result['error']}")
         except Exception as e:
-            print(f"[WHATSAPP GATEWAY] Error dispatching Green API payload: {e}")
-            
+            result["error"] = str(e)
+            print(f"[WHATSAPP] Green API exception: {e}")
+
     elif wa_provider == "twilio" and wa_token and wa_instance:
         try:
             import requests
@@ -146,20 +176,23 @@ def send_whatsapp_message(phone: str, message: str) -> Optional[str]:
             data = {
                 "From": from_number,
                 "To": f"whatsapp:{formatted_phone_wa}",
-                "Body": message
+                "Body": message,
             }
-            requests.post(url, data=data, auth=HTTPBasicAuth(wa_instance, wa_token), timeout=5)
-            print("[WHATSAPP GATEWAY] Sent successfully via Twilio Gateway.")
+            response = requests.post(url, data=data, auth=HTTPBasicAuth(wa_instance, wa_token), timeout=15)
+            if response.status_code in (200, 201):
+                result["success"] = True
+                print("[WHATSAPP] Twilio accepted message.")
+            else:
+                result["error"] = f"Twilio HTTP {response.status_code}: {response.text}"
+                print(f"[WHATSAPP] Twilio error: {result['error']}")
         except Exception as e:
-            print(f"[WHATSAPP GATEWAY] Error dispatching Twilio payload: {e}")
-            
+            result["error"] = str(e)
+            print(f"[WHATSAPP] Twilio exception: {e}")
     else:
-        print("[WHATSAPP GATEWAY] No active production gateway configured. Operating in simulation mode.")
+        result["error"] = "WhatsApp gateway not configured. Set WHATSAPP_PROVIDER, WHATSAPP_API_TOKEN, and WHATSAPP_INSTANCE_ID."
+        print("[WHATSAPP] Simulation mode only. Configure Green API or Twilio env vars for live delivery.")
 
-    # Always generate the click-to-chat deep-link URL as front-end fallback verification
-    encoded_message = base64.b64encode(message.encode('utf-8')).decode('utf-8')
-    wa_link = f"https://wa.me/{normalized_number}?text={message.replace(' ', '%20')}"
-    return wa_link
+    return result
 
 # ==========================================
 # DATABASE MODELS
@@ -733,6 +766,18 @@ def register(
     if existing:
         return JSONResponse(status_code=400, content={"message": "Email already registered."})
 
+    if not address or not address.strip():
+        return JSONResponse(status_code=400, content={"message": "Please select your Division and Area."})
+
+    try:
+        lat_value = float(lat)
+        lng_value = float(lng)
+    except (TypeError, ValueError):
+        return JSONResponse(status_code=400, content={"message": "Please select a valid Division and Area."})
+
+    if role == "vet" and (not clinic_name.strip() or not license_number.strip()):
+        return JSONResponse(status_code=400, content={"message": "Veterinarians must provide clinic name and license number."})
+
     new_user = User(
         name=name,
         email=email,
@@ -740,8 +785,8 @@ def register(
         hashed_password=hash_password(password),
         role=role,
         address=address,
-        location_lat=lat,
-        location_lng=lng,
+        location_lat=lat_value,
+        location_lng=lng_value,
         clinic_name=clinic_name if role == "vet" else None,
         license_number=license_number if role == "vet" else None,
         specialization=specialization if role == "vet" else None,
@@ -758,14 +803,18 @@ def register(
 
     # Trigger WhatsApp Dispatch
     message_text = f"Your PetPals verification OTP is: {mock_otp}. Welcome to the premium companion lifecycle network!"
-    wa_direct_link = send_whatsapp_message(phone, message_text)
+    wa_result = send_whatsapp_message(phone, message_text)
 
     return {
         "message": "Registration successful. Verification OTP sent via WhatsApp.",
         "email": email,
-        "whatsapp_link": wa_direct_link,
+        "role": role,
+        "whatsapp_link": wa_result.get("whatsapp_link"),
         "phone": phone,
         "otp_sent": True,
+        "whatsapp_delivered": wa_result.get("success", False),
+        "whatsapp_provider": wa_result.get("provider"),
+        "whatsapp_error": wa_result.get("error"),
     }
 
 @app.post("/api/auth/resend-otp")
@@ -779,12 +828,15 @@ def resend_otp(email: str = Form(...), db: Session = Depends(get_db)):
     db.commit()
 
     message_text = f"Your PetPals verification OTP is: {new_otp}. Welcome to the premium companion lifecycle network!"
-    wa_direct_link = send_whatsapp_message(user.phone, message_text)
+    wa_result = send_whatsapp_message(user.phone, message_text)
 
     return {
         "message": "A new verification code has been sent to your WhatsApp.",
-        "whatsapp_link": wa_direct_link,
+        "whatsapp_link": wa_result.get("whatsapp_link"),
         "phone": user.phone,
+        "whatsapp_delivered": wa_result.get("success", False),
+        "whatsapp_provider": wa_result.get("provider"),
+        "whatsapp_error": wa_result.get("error"),
     }
 
 @app.post("/api/auth/verify-otp")
@@ -1215,12 +1267,13 @@ def initiate_transfer(
     target_phone = target_user.phone if target_user else current_user.phone # fallback to current owner
 
     message_text = f"PetPals Transfer Authorization: Enter code {otp_code} to accept ownership of pet {pet.name} ({pet.unique_id})."
-    wa_direct_link = send_whatsapp_message(target_phone, message_text)
+    wa_result = send_whatsapp_message(target_phone, message_text)
     
     return {
         "message": "Transfer initiated. Code dispatched successfully.",
         "otp_sent": otp_code,
-        "whatsapp_link": wa_direct_link,
+        "whatsapp_link": wa_result.get("whatsapp_link"),
+        "whatsapp_delivered": wa_result.get("success", False),
         "phone": target_phone
     }
 
@@ -1784,11 +1837,11 @@ def index_portal():
                         <div class="grid grid-cols-2 gap-3">
                             <div>
                                 <label class="block text-xs text-slate-600 mb-1">Clinic Name</label>
-                                <input type="text" name="clinic_name" class="w-full px-3 py-1.5 rounded-lg border border-slate-200 bg-white">
+                                <input type="text" name="clinic_name" id="reg-clinic-name" class="w-full px-3 py-1.5 rounded-lg border border-slate-200 bg-white">
                             </div>
                             <div>
                                 <label class="block text-xs text-slate-600 mb-1">License No.</label>
-                                <input type="text" name="license_number" class="w-full px-3 py-1.5 rounded-lg border border-slate-200 bg-white" placeholder="LIC-XXXX">
+                                <input type="text" name="license_number" id="reg-license-number" class="w-full px-3 py-1.5 rounded-lg border border-slate-200 bg-white" placeholder="LIC-XXXX">
                             </div>
                         </div>
                         <div>
@@ -2162,9 +2215,15 @@ def index_portal():
                         <div class="mx-auto w-14 h-14 bg-emerald-50 rounded-full flex items-center justify-center">
                             <i data-lucide="smartphone" class="w-7 h-7 text-emerald-600"></i>
                         </div>
-                        <p class="text-sm text-slate-600">We sent a 6-digit verification code to your WhatsApp number:</p>
+                        <p id="otp-verify-heading" class="text-sm text-slate-600">We sent a 6-digit verification code to your WhatsApp number:</p>
                         <p id="otp-verify-phone" class="font-bold text-slate-900 text-lg"></p>
+                        <p id="otp-verify-role-note" class="hidden text-xs text-amber-800 bg-amber-50 border border-amber-100 rounded-lg p-2 text-left"></p>
+                        <p id="otp-delivery-status" class="text-xs text-slate-500"></p>
                     </div>
+                    <a id="otp-whatsapp-fallback" href="#" target="_blank" rel="noopener" class="hidden w-full bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 text-emerald-800 font-bold text-center py-2.5 rounded-xl transition flex items-center justify-center gap-1.5 text-xs">
+                        <i data-lucide="send" class="w-4 h-4"></i>
+                        <span>Open WhatsApp to receive code</span>
+                    </a>
                     <div>
                         <label class="block text-xs font-bold text-slate-500 uppercase mb-2 text-center">Enter Verification Code</label>
                         <input type="text" id="otp-input" maxlength="6" inputmode="numeric" pattern="[0-9]{6}" placeholder="000000" required class="w-full text-center text-2xl tracking-[0.4em] font-mono py-3 border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-500 bg-white">
@@ -2790,6 +2849,61 @@ def index_portal():
                 }
             }
 
+            function setVetFieldRequirements(isVet) {
+                const clinic = document.getElementById('reg-clinic-name');
+                const license = document.getElementById('reg-license-number');
+                if (clinic) clinic.required = isVet;
+                if (license) license.required = isVet;
+            }
+
+            function getApiErrorMessage(res) {
+                if (res.message) return res.message;
+                if (typeof res.detail === 'string') return res.detail;
+                if (Array.isArray(res.detail)) {
+                    return res.detail.map(item => item.msg || item).join(', ');
+                }
+                return 'Request failed. Please try again.';
+            }
+
+            function showOtpVerificationModal(res, fallbackPhone) {
+                const role = res.role || document.getElementById('reg-role-input').value || 'owner';
+                document.getElementById('otp-email-field').value = res.email || '';
+                document.getElementById('otp-verify-phone').innerText = formatPhoneDisplay(res.phone || fallbackPhone);
+                document.getElementById('otp-input').value = '';
+
+                const roleNote = document.getElementById('otp-verify-role-note');
+                if (role === 'vet') {
+                    roleNote.textContent = 'After OTP verification, your veterinarian license will be reviewed by an admin before you can sign in.';
+                    roleNote.classList.remove('hidden');
+                } else {
+                    roleNote.classList.add('hidden');
+                    roleNote.textContent = '';
+                }
+
+                const deliveryStatus = document.getElementById('otp-delivery-status');
+                const waFallback = document.getElementById('otp-whatsapp-fallback');
+                if (res.whatsapp_delivered) {
+                    deliveryStatus.textContent = 'Code delivered to WhatsApp successfully.';
+                    deliveryStatus.className = 'text-xs text-emerald-700';
+                    waFallback.classList.add('hidden');
+                } else {
+                    deliveryStatus.textContent = res.whatsapp_error
+                        ? `Automatic WhatsApp delivery failed: ${res.whatsapp_error}`
+                        : 'Automatic WhatsApp delivery is not configured. Use the button below to open WhatsApp.';
+                    deliveryStatus.className = 'text-xs text-amber-700';
+                    if (res.whatsapp_link) {
+                        waFallback.href = res.whatsapp_link;
+                        waFallback.classList.remove('hidden');
+                    } else {
+                        waFallback.classList.add('hidden');
+                    }
+                }
+
+                openModal('otp-verify');
+                setTimeout(() => document.getElementById('otp-input').focus(), 150);
+                lucide.createIcons();
+            }
+
             function selectRegisterRole(role) {
                 document.getElementById('reg-role-input').value = role;
                 const ownerCard = document.getElementById('role-card-owner');
@@ -2799,10 +2913,12 @@ def index_portal():
                     ownerCard.className = "cursor-pointer border-2 border-teal-500 bg-teal-50/50 rounded-2xl p-4 text-center transition flex flex-col items-center justify-center space-y-2";
                     vetCard.className = "cursor-pointer border-2 border-slate-100 bg-white rounded-2xl p-4 text-center transition flex flex-col items-center justify-center space-y-2 hover:border-teal-200";
                     document.getElementById('vet-fields').classList.add('hidden');
+                    setVetFieldRequirements(false);
                 } else {
                     vetCard.className = "cursor-pointer border-2 border-teal-500 bg-teal-50/50 rounded-2xl p-4 text-center transition flex flex-col items-center justify-center space-y-2";
                     ownerCard.className = "cursor-pointer border-2 border-slate-100 bg-white rounded-2xl p-4 text-center transition flex flex-col items-center justify-center space-y-2 hover:border-teal-200";
                     document.getElementById('vet-fields').classList.remove('hidden');
+                    setVetFieldRequirements(true);
                 }
             }
 
@@ -2963,19 +3079,38 @@ def index_portal():
 
             async function handleRegister(e) {
                 e.preventDefault();
-                const fd = new FormData(e.target);
+                mapRegisterLocation();
+
+                const form = e.target;
+                const role = document.getElementById('reg-role-input').value;
+                const address = document.getElementById('reg-address').value;
+                const lat = document.getElementById('reg-lat').value;
+                const lng = document.getElementById('reg-lng').value;
+
+                if (!address || !lat || !lng) {
+                    showAlert("Please select your Division and Area before creating an account.", "error");
+                    return;
+                }
+
+                if (role === 'vet') {
+                    const clinic = document.getElementById('reg-clinic-name').value.trim();
+                    const license = document.getElementById('reg-license-number').value.trim();
+                    if (!clinic || !license) {
+                        showAlert("Veterinarians must enter clinic name and license number.", "error");
+                        return;
+                    }
+                }
+
+                const fd = new FormData(form);
                 const resp = await apiFetch('/api/auth/register', { method: 'POST', body: fd });
                 const res = await resp.json();
                 if (resp.ok) {
-                    document.getElementById('otp-email-field').value = res.email || fd.get('email');
-                    document.getElementById('otp-verify-phone').innerText = formatPhoneDisplay(res.phone || fd.get('phone'));
-                    document.getElementById('otp-input').value = '';
-                    openModal('otp-verify');
-                    setTimeout(() => document.getElementById('otp-input').focus(), 150);
-                    lucide.createIcons();
-                    showAlert("Verification code sent to your WhatsApp number.");
+                    showOtpVerificationModal(res, fd.get('phone'));
+                    showAlert(res.whatsapp_delivered
+                        ? "Verification code sent to your WhatsApp number."
+                        : "Account created. Open WhatsApp from the popup if the code did not arrive automatically.");
                 } else {
-                    showAlert(res.message, 'error');
+                    showAlert(getApiErrorMessage(res), 'error');
                 }
             }
 
@@ -3006,7 +3141,10 @@ def index_portal():
                 const resp = await apiFetch('/api/auth/verify-otp', { method: 'POST', body: fd });
                 const res = await resp.json();
                 if (resp.ok) {
-                    showAlert("Account verified successfully! You can now sign in.");
+                    const isVetFlow = !document.getElementById('otp-verify-role-note').classList.contains('hidden');
+                    showAlert(isVetFlow
+                        ? "Account verified! An admin will review your veterinarian license before you can sign in."
+                        : "Account verified successfully! You can now sign in.");
                     closeModal('otp-verify');
                     toggleAuthTab('login');
                 } else {
@@ -3022,12 +3160,12 @@ def index_portal():
                 const resp = await apiFetch('/api/auth/resend-otp', { method: 'POST', body: fd });
                 const res = await resp.json();
                 if (resp.ok) {
-                    document.getElementById('otp-verify-phone').innerText = formatPhoneDisplay(res.phone);
-                    document.getElementById('otp-input').value = '';
-                    document.getElementById('otp-input').focus();
-                    showAlert("A new verification code has been sent to your WhatsApp.");
+                    showOtpVerificationModal(res, res.phone);
+                    showAlert(res.whatsapp_delivered
+                        ? "A new verification code has been sent to your WhatsApp."
+                        : "Code regenerated. Use Open WhatsApp in the popup if it did not arrive automatically.");
                 } else {
-                    showAlert(res.detail || "Could not resend verification code.", "error");
+                    showAlert(getApiErrorMessage(res), "error");
                 }
             }
 
