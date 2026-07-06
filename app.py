@@ -108,6 +108,9 @@ def normalize_whatsapp_number(phone: str) -> str:
         return '880' + clean_digits
     return clean_digits
 
+def is_email_login(value: str) -> bool:
+    return bool(value and "@" in value)
+
 def send_whatsapp_message(phone: str, message: str) -> Dict[str, Any]:
     """
     Dispatches WhatsApp messages via Green API, Twilio, or simulation fallback.
@@ -348,6 +351,29 @@ class SiteConfig(Base):
     id = Column(Integer, primary_key=True, index=True)
     key = Column(String, unique=True, index=True, nullable=False)
     value = Column(Text, nullable=False)
+
+def is_placeholder_email(email: str) -> bool:
+    return bool(email and email.endswith("@phone.petpals.local"))
+
+def build_internal_email(email: str, normalized_phone: str) -> str:
+    email_clean = (email or "").strip().lower()
+    if email_clean:
+        return email_clean
+    return f"{normalized_phone}@phone.petpals.local"
+
+def find_user_by_login(db: Session, login: str) -> Optional[User]:
+    login_value = (login or "").strip()
+    if not login_value:
+        return None
+    if is_email_login(login_value):
+        return db.query(User).filter(func.lower(User.email) == login_value.lower()).first()
+    normalized = normalize_whatsapp_number(login_value)
+    if not normalized:
+        return None
+    for user in db.query(User).filter(User.phone.isnot(None)).all():
+        if normalize_whatsapp_number(user.phone) == normalized:
+            return user
+    return None
 
 # ==========================================
 # DATABASE MIGRATIONS & SCHEMA PATCHING
@@ -739,7 +765,7 @@ def get_user_profile(current_user: User = Depends(get_current_user)):
     return {
         "id": current_user.id,
         "name": current_user.name,
-        "email": current_user.email,
+        "email": current_user.email if not is_placeholder_email(current_user.email) else None,
         "phone": current_user.phone,
         "role": current_user.role,
         "address": current_user.address,
@@ -750,7 +776,7 @@ def get_user_profile(current_user: User = Depends(get_current_user)):
 @app.post("/api/auth/register")
 def register(
     name: str = Form(...),
-    email: str = Form(...),
+    email: str = Form(""),
     password: str = Form(...),
     phone: str = Form(...),
     role: str = Form(...),  # owner, vet
@@ -762,9 +788,25 @@ def register(
     specialization: str = Form(""),
     db: Session = Depends(get_db)
 ):
-    existing = db.query(User).filter(User.email == email).first()
-    if existing:
-        return JSONResponse(status_code=400, content={"message": "Email already registered."})
+    normalized_phone = normalize_whatsapp_number(phone)
+    if len(normalized_phone) < 11:
+        return JSONResponse(status_code=400, content={"message": "Please enter a valid WhatsApp enabled number (e.g. 01712-XXXXXX)."})
+
+    if find_user_by_login(db, phone):
+        return JSONResponse(status_code=400, content={"message": "This WhatsApp number is already registered."})
+
+    email_clean = (email or "").strip().lower()
+    if email_clean:
+        if "@" not in email_clean or "." not in email_clean.split("@")[-1]:
+            return JSONResponse(status_code=400, content={"message": "Please enter a valid email address."})
+        existing_email = db.query(User).filter(func.lower(User.email) == email_clean).first()
+        if existing_email:
+            return JSONResponse(status_code=400, content={"message": "Email already registered."})
+        stored_email = email_clean
+    else:
+        stored_email = build_internal_email("", normalized_phone)
+        if db.query(User).filter(User.email == stored_email).first():
+            return JSONResponse(status_code=400, content={"message": "This WhatsApp number is already registered."})
 
     if not address or not address.strip():
         return JSONResponse(status_code=400, content={"message": "Please select your Division and Area."})
@@ -780,8 +822,8 @@ def register(
 
     new_user = User(
         name=name,
-        email=email,
-        phone=phone,
+        email=stored_email,
+        phone=phone.strip(),
         hashed_password=hash_password(password),
         role=role,
         address=address,
@@ -805,12 +847,15 @@ def register(
     message_text = f"Your PetPals verification OTP is: {mock_otp}. Welcome to the premium companion lifecycle network!"
     wa_result = send_whatsapp_message(phone, message_text)
 
+    login_key = email_clean if email_clean else phone.strip()
+
     return {
         "message": "Registration successful. Verification OTP sent via WhatsApp.",
-        "email": email,
+        "login": login_key,
+        "email": email_clean or None,
         "role": role,
         "whatsapp_link": wa_result.get("whatsapp_link"),
-        "phone": phone,
+        "phone": phone.strip(),
         "otp_sent": True,
         "whatsapp_delivered": wa_result.get("success", False),
         "whatsapp_provider": wa_result.get("provider"),
@@ -818,8 +863,8 @@ def register(
     }
 
 @app.post("/api/auth/resend-otp")
-def resend_otp(email: str = Form(...), db: Session = Depends(get_db)):
-    user = db.query(User).filter(User.email == email).first()
+def resend_otp(login: str = Form(...), db: Session = Depends(get_db)):
+    user = find_user_by_login(db, login)
     if not user or user.otp_secret is None:
         raise HTTPException(status_code=400, detail="No pending verification found for this account.")
 
@@ -832,6 +877,7 @@ def resend_otp(email: str = Form(...), db: Session = Depends(get_db)):
 
     return {
         "message": "A new verification code has been sent to your WhatsApp.",
+        "login": login,
         "whatsapp_link": wa_result.get("whatsapp_link"),
         "phone": user.phone,
         "whatsapp_delivered": wa_result.get("success", False),
@@ -840,8 +886,8 @@ def resend_otp(email: str = Form(...), db: Session = Depends(get_db)):
     }
 
 @app.post("/api/auth/verify-otp")
-def verify_otp(email: str = Form(...), otp: str = Form(...), db: Session = Depends(get_db)):
-    user = db.query(User).filter(User.email == email).first()
+def verify_otp(login: str = Form(...), otp: str = Form(...), db: Session = Depends(get_db)):
+    user = find_user_by_login(db, login)
     if not user or user.otp_secret != otp:
         raise HTTPException(status_code=400, detail="Invalid verification OTP.")
     
@@ -850,10 +896,10 @@ def verify_otp(email: str = Form(...), otp: str = Form(...), db: Session = Depen
     return {"message": "Account successfully verified."}
 
 @app.post("/api/auth/login")
-def login(email: str = Form(...), password: str = Form(...), db: Session = Depends(get_db)):
-    user = db.query(User).filter(User.email == email).first()
+def login(login: str = Form(...), password: str = Form(...), db: Session = Depends(get_db)):
+    user = find_user_by_login(db, login)
     if not user or not verify_password(password, user.hashed_password):
-        return JSONResponse(status_code=401, content={"message": "Invalid email or password."})
+        return JSONResponse(status_code=401, content={"message": "Invalid login or password."})
     
     if user.role == "vet" and not user.is_approved:
         if user.is_rejected:
@@ -1756,8 +1802,9 @@ def index_portal():
                 <!-- LOGIN FORM -->
                 <form id="form-login" onsubmit="handleLogin(event)" class="space-y-4">
                     <div>
-                        <label class="block text-xs font-bold text-slate-600 uppercase mb-1">Email Address</label>
-                        <input type="email" name="email" required class="w-full px-4 py-2.5 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-teal-500 bg-white" placeholder="owner@petpals.com">
+                        <label class="block text-xs font-bold text-slate-600 uppercase mb-1">Email or WhatsApp Number</label>
+                        <input type="text" name="login" required class="w-full px-4 py-2.5 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-teal-500 bg-white" placeholder="owner@petpals.com or 01712-XXXXXX">
+                        <p class="text-[10px] text-slate-400 mt-1">Sign in with your email address or WhatsApp enabled number.</p>
                     </div>
                     <div>
                         <label class="block text-xs font-bold text-slate-600 uppercase mb-1">Password</label>
@@ -1793,15 +1840,15 @@ def index_portal():
                         <label class="block text-xs font-bold text-slate-600 uppercase mb-1">Full Name</label>
                         <input type="text" name="name" required class="w-full px-4 py-2.5 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-teal-500 bg-white">
                     </div>
-                    <div class="grid grid-cols-2 gap-4">
-                        <div>
-                            <label class="block text-xs font-bold text-slate-600 uppercase mb-1">Email</label>
-                            <input type="email" name="email" required class="w-full px-4 py-2.5 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-teal-500 bg-white">
-                        </div>
-                        <div>
-                            <label class="block text-xs font-bold text-slate-600 uppercase mb-1">Phone</label>
-                            <input type="text" name="phone" required class="w-full px-4 py-2.5 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-teal-500 bg-white" placeholder="01712-XXXXXX">
-                        </div>
+                    <div>
+                        <label class="block text-xs font-bold text-slate-600 uppercase mb-1">WhatsApp Enabled Number</label>
+                        <input type="tel" name="phone" id="reg-phone" required class="w-full px-4 py-2.5 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-teal-500 bg-white" placeholder="01712-XXXXXX">
+                        <p class="text-[10px] text-slate-400 mt-1">Your verification OTP will be sent to this WhatsApp number.</p>
+                    </div>
+                    <div>
+                        <label class="block text-xs font-bold text-slate-600 uppercase mb-1">Email Address <span class="text-slate-400 font-semibold normal-case">(Optional)</span></label>
+                        <input type="email" name="email" class="w-full px-4 py-2.5 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-teal-500 bg-white" placeholder="owner@petpals.com">
+                        <p class="text-[10px] text-slate-400 mt-1">Add an email if you want to sign in with email instead of WhatsApp number.</p>
                     </div>
                     <div>
                         <label class="block text-xs font-bold text-slate-600 uppercase mb-1">Password</label>
@@ -2228,7 +2275,7 @@ def index_portal():
                         <label class="block text-xs font-bold text-slate-500 uppercase mb-2 text-center">Enter Verification Code</label>
                         <input type="text" id="otp-input" maxlength="6" inputmode="numeric" pattern="[0-9]{6}" placeholder="000000" required class="w-full text-center text-2xl tracking-[0.4em] font-mono py-3 border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-500 bg-white">
                     </div>
-                    <input type="hidden" id="otp-email-field">
+                    <input type="hidden" id="otp-login-field">
                     <button type="submit" class="w-full bg-emerald-600 hover:bg-emerald-700 text-white font-bold py-3 rounded-xl transition">Verify & Activate Account</button>
                     <button type="button" onclick="handleResendOTP()" class="w-full text-sm text-emerald-700 font-semibold hover:text-emerald-900 transition">Resend code to WhatsApp</button>
                 </form>
@@ -2867,7 +2914,7 @@ def index_portal():
 
             function showOtpVerificationModal(res, fallbackPhone) {
                 const role = res.role || document.getElementById('reg-role-input').value || 'owner';
-                document.getElementById('otp-email-field').value = res.email || '';
+                document.getElementById('otp-login-field').value = res.login || res.email || res.phone || fallbackPhone;
                 document.getElementById('otp-verify-phone').innerText = formatPhoneDisplay(res.phone || fallbackPhone);
                 document.getElementById('otp-input').value = '';
 
@@ -3101,6 +3148,12 @@ def index_portal():
                     }
                 }
 
+                const whatsappNumber = document.getElementById('reg-phone').value.trim();
+                if (!whatsappNumber) {
+                    showAlert("WhatsApp enabled number is required.", "error");
+                    return;
+                }
+
                 const fd = new FormData(form);
                 const resp = await apiFetch('/api/auth/register', { method: 'POST', body: fd });
                 const res = await resp.json();
@@ -3129,13 +3182,13 @@ def index_portal():
             async function handleVerifyOTP(e) {
                 if (e) e.preventDefault();
                 const otp = document.getElementById('otp-input').value.trim();
-                const email = document.getElementById('otp-email-field').value;
+                const login = document.getElementById('otp-login-field').value;
                 if (!otp || otp.length !== 6) {
                     showAlert("Please enter the 6-digit code from WhatsApp.", "error");
                     return;
                 }
                 const fd = new FormData();
-                fd.append('email', email);
+                fd.append('login', login);
                 fd.append('otp', otp);
                 
                 const resp = await apiFetch('/api/auth/verify-otp', { method: 'POST', body: fd });
@@ -3153,10 +3206,10 @@ def index_portal():
             }
 
             async function handleResendOTP() {
-                const email = document.getElementById('otp-email-field').value;
-                if (!email) return;
+                const login = document.getElementById('otp-login-field').value;
+                if (!login) return;
                 const fd = new FormData();
-                fd.append('email', email);
+                fd.append('login', login);
                 const resp = await apiFetch('/api/auth/resend-otp', { method: 'POST', body: fd });
                 const res = await resp.json();
                 if (resp.ok) {
